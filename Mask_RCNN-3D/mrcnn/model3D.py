@@ -50,10 +50,9 @@ def log(text, array=None):
     print(text)
 
 def compute_backbone_shapes(config, image_shape):
-    """Computes the width, height and depth of each stage of the backbone network.
-
+    """Computes the width and height of each stage of the backbone network.
     Returns:
-        [N, (depth, height, width)]. Where N is the number of stages
+        [N, (height, width)]. Where N is the number of stages
     """
     if callable(config.BACKBONE):
         return config.COMPUTE_BACKBONE_SHAPE(image_shape)
@@ -61,27 +60,17 @@ def compute_backbone_shapes(config, image_shape):
     # Currently supports ResNet only
     assert config.BACKBONE in ["resnet50", "resnet101"]
     return np.array(
-        [[int(math.ceil(image_shape[0] / stride)),
+        [  [int(math.ceil(image_shape[0] / stride)),
             int(math.ceil(image_shape[1] / stride)),
             int(math.ceil(image_shape[2] / stride))]
             for stride in config.BACKBONE_STRIDES])
 
 
 ############################################################
-#  Resnet Graph
-############################################################
-
-# Code adopted from:
-# https://github.com/fchollet/deep-learning-models/blob/master/resnet50.py
-
-
-
-############################################################
 #  Proposal Layer
 ############################################################
 
-
-def apply_box_deltas_graph(boxes, deltas):
+def apply_box_deltas(boxes, deltas):
     """Applies the given deltas to the given boxes.
     boxes: [N, (z1, y1, x1, z2, y2, x2)] boxes to update
     deltas: [N, (dz, dy, dx, log(dd), log(dh), log(dw))] refinements to apply
@@ -112,7 +101,7 @@ def apply_box_deltas_graph(boxes, deltas):
 
 
 
-def clip_boxes_graph(boxes, window):
+def clip_boxes(boxes, window):
     """
     boxes: [N, (z1, y1, x1, z2, y2, x2)]
     window: [6] in the form z1, y1, x1, z2, y2, x2
@@ -132,7 +121,82 @@ def clip_boxes_graph(boxes, window):
     return clipped
 
 
-# class ProposalLayer(KE.Layer):
+class ProposalLayer(KE.Layer):
+    """Receives anchor scores and selects a subset to pass as proposals
+    to the second stage. Filtering is done based on anchor scores and
+    non-max suppression to remove overlaps. It also applies bounding
+    box refinement deltas to anchors.
+    Inputs:
+        rpn_probs: [batch, num_anchors, (bg prob, fg prob)]
+        rpn_bbox: [batch, num_anchors, (dz, dy, dx, log(dd), log(dh), log(dw))]
+        anchors: [batch, num_anchors, (z1, y1, x1, z2, y2, x2)] anchors in normalized coordinates
+    Returns:
+        Proposals in normalized coordinates [batch, rois, (z1, y1, x1, z2, y2, x2)]
+    """
+
+    def __init__(self, proposal_count, nms_threshold, config=None, **kwargs):
+        super(ProposalLayer, self).__init__(**kwargs)
+        self.config = config
+        self.proposal_count = proposal_count
+        self.nms_threshold = nms_threshold
+
+    def call(self, inputs):
+        # Box Scores. Use the foreground class confidence. [Batch, num_rois, 1]
+        scores = inputs[0][:, :, 1]
+        # Box deltas [batch, num_rois, 6]
+        deltas = inputs[1]
+        deltas = deltas * np.reshape(self.config.RPN_BBOX_STD_DEV, [1, 1, 6])
+        # Anchors
+        anchors = inputs[2]
+
+        # Improve performance by trimming to top anchors by score
+        # and doing the rest on the smaller subset.
+        pre_nms_limit = tf.minimum(self.config.PRE_NMS_LIMIT, tf.shape(anchors)[1])
+        ix = tf.nn.top_k(scores, pre_nms_limit, sorted=True,
+                         name="top_anchors").indices
+        scores = utils.batch_slice([scores, ix], lambda x, y: tf.gather(x, y),
+                                   self.config.IMAGES_PER_GPU)
+        deltas = utils.batch_slice([deltas, ix], lambda x, y: tf.gather(x, y),
+                                   self.config.IMAGES_PER_GPU)
+        pre_nms_anchors = utils.batch_slice([anchors, ix], lambda a, x: tf.gather(a, x),
+                                    self.config.IMAGES_PER_GPU,
+                                    names=["pre_nms_anchors"])
+
+        # Apply deltas to anchors to get refined anchors.
+        # [batch, N, (z1, y1, x1, z2, y2, x2)]
+        boxes = utils.batch_slice([pre_nms_anchors, deltas],
+                                  lambda x, y: apply_box_deltas(x, y),
+                                  self.config.IMAGES_PER_GPU,
+                                  names=["refined_anchors"])
+
+        # Clip to image boundaries. Since we're in normalized coordinates,
+        # clip to 0..1 range. [batch, N, (z1, y1, x1, z2, y2, x2)]
+        window = np.array([0, 0, 0, 1, 1, 1], dtype=np.float32)
+        boxes = utils.batch_slice(boxes,
+                                  lambda x: clip_boxes_graph(x, window),
+                                  self.config.IMAGES_PER_GPU,
+                                  names=["refined_anchors_clipped"])
+
+        # Filter out small boxes
+        # According to Xinlei Chen's paper, this reduces detection accuracy
+        # for small objects, so we're skipping it.
+
+        # Non-max suppression
+        def nms(boxes, scores):
+            indices = tf.image.non_max_suppression(
+                boxes, scores, self.proposal_count,
+                self.nms_threshold, name="rpn_non_max_suppression")
+            proposals = tf.gather(boxes, indices)
+            # Pad if needed
+            padding = tf.maximum(self.proposal_count - tf.shape(proposals)[0], 0)
+            proposals = tf.pad(proposals, [(0, padding), (0, 0)])
+            return proposals
+        proposals = utils.batch_slice([boxes, scores], nms,
+                                      self.config.IMAGES_PER_GPU)
+        return proposals
+
+    def compute_output_shape(self, input_shape):
+        return (None, self.proposal_count, 4)
 
 
 
@@ -145,13 +209,6 @@ def log2_graph(x):
     return tf.log(x) / tf.log(2.0)
 
 
-# class PyramidROIAlign(KE.Layer):
-
-############################################################
-#  Detection Target Layer
-############################################################
-
-# class DetectionTargetLayer(KE.Layer):
 
 
 ############################################################
@@ -234,8 +291,8 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
         right/left 50% of the time.
     use_mini_mask: If False, returns full-size masks that are the same depth,
         height and width as the original image. These can be big, for example
-        1024x1024x1024x100 (for 100 instances). Mini masks are smaller, 
-        typically, 224x224x224 and are generated by extracting the bounding 
+        1024x1024x1024x100 (for 100 instances). Mini masks are smaller,
+        typically, 224x224x224 and are generated by extracting the bounding
         box of the object and resizing it to MINI_MASK_SHAPE.
 
     Returns:
@@ -243,7 +300,7 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
     shape: the original shape of the image before resizing and cropping.
     class_ids: [instance_count] Integer class IDs
     bbox: [instance_count, (z1, y1, x1, z2, y2, x2)]
-    mask: [height, height, width, instance_count]. The height and width are 
+    mask: [height, height, width, instance_count]. The height and width are
         those of the image unless use_mini_mask is True, in which case they are
         defined in MINI_MASK_SHAPE.
     """
@@ -290,7 +347,7 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
         assert mask.shape == mask_shape, "Augmentation shouldn't change mask size"
         # Change mask back to bool
         mask = mask.astype(np.bool)
-        
+
     # Note that some boxes might be all zeros if the corresponding mask got cropped out.
     # and here is to filter them out
     _idx = np.sum(mask, axis=(0, 1, 2)) > 0
@@ -448,7 +505,7 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
     bboxes /= config.BBOX_STD_DEV
 
     # Generate class-specific target masks
-    masks = np.zeros((config.TRAIN_ROIS_PER_IMAGE, config.MASK_SHAPE[0], config.MASK_SHAPE[1], 
+    masks = np.zeros((config.TRAIN_ROIS_PER_IMAGE, config.MASK_SHAPE[0], config.MASK_SHAPE[1],
     config.MASK_SHAPE[2], config.NUM_CLASSES),
                      dtype=np.float32)
     for i in pos_ids:
@@ -873,7 +930,7 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
 # class MaskRCNN():
 
 
- 
+
 ############################################################
 #  Data Formatting
 ############################################################

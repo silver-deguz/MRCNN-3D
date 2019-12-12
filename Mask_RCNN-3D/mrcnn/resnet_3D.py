@@ -7,7 +7,7 @@ import keras.engine as KE
 from keras.layers import Conv3D, MaxPooling3D, AveragePooling3D
 from keras.layers import Activation, Add, ZeroPadding3D
 from keras.models import Model
-from modelutils_3D import BatchNorm
+from model_utils_3D import BatchNorm
 
 ## Tensorflow backend default input shape D x H x W x C
 
@@ -46,7 +46,7 @@ def identity_block(input_shape, filters, stage, block, kernel_size=3, \
     x = BatchNorm(name=bn_name_base + '2b')(x, training=train_bn)
     x = Activation('relu')(x)
 
-    x = Conv3D(filters=filt3, kernel_size=1), \
+    x = Conv3D(filters=filt3, kernel_size=1, \
               name=conv_name_base + '2c', use_bias=use_bias)(x)
     x = BatchNorm(name=bn_name_base + '2c')(x, training=train_bn)
 
@@ -93,7 +93,6 @@ def conv_block(input_shape, filters, stage, block, kernel_size=3, \
     shortcut = Conv3D(filters=filt3, kernel_size=1, strides=strides, \
                       name=conv_name_base + '1', use_bias=use_bias)(input_shape)
     shortcut = BatchNorm(name=bn_name_base + '1')(shortcut, training=train_bn)
-#     shortcut = BatchNormalization(axis=CHANNEL_AXIS, name=bn_name_base + '1')(shortcut)
 
     x = Add()([x, shortcut])
     x = Activation('relu', name='res' + str(stage) + block + '_out')(x)
@@ -136,14 +135,14 @@ class ResNet(object):
             C5 = None
         return [C1, C2, C3, C4, C5]
 
-@staticmethod
+# @staticmethod
 def ResNet50(input_shape, stage5, train_bn):
     """Builds a ResNet50 model."""
-    model = ResNet3D.build(input_shape, 'resnet50', stage5, train_bn)
+    model = ResNet.build(input_shape, 'resnet50', stage5, train_bn)
     return model
 
-@staticmethod
+# @staticmethod
 def ResNet101(input_shape, stage5, train_bn):
     """Builds a ResNet101 model."""
-    model = ResNet3D.build(input_shape, 'resnet101', stage5, train_bn)
+    model = ResNet.build(input_shape, 'resnet101', stage5, train_bn)
     return model

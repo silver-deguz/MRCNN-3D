@@ -130,7 +130,7 @@ def non_max_suppression(boxes, scores, threshold):
     if boxes.dtype.kind != "f":
         boxes = boxes.astype(np.float32)
 
-    # Compute box areas
+    # Compute box volumes
     z1 = boxes[:, 0]
     y1 = boxes[:, 1]
     x1 = boxes[:, 2]
@@ -148,7 +148,7 @@ def non_max_suppression(boxes, scores, threshold):
         i = ixs[0]
         pick.append(i)
         # Compute IoU of the picked box with the rest
-        iou = compute_iou_3D(boxes[i], boxes[ixs[1:]], vol[i], vol[ixs[1:]])
+        iou = compute_iou(boxes[i], boxes[ixs[1:]], vol[i], vol[ixs[1:]])
         # Identify boxes with IoU over the threshold. This
         # returns indices into ixs[1:], so add 1 to get
         # indices into ixs.
@@ -158,41 +158,41 @@ def non_max_suppression(boxes, scores, threshold):
         ixs = np.delete(ixs, 0)
     return np.array(pick, dtype=np.int32)
 
-def non_max_suppression_graph(boxes, scores, max_output_size, threshold):
-    """Performs non-maximum suppression and returns indices of kept boxes.
-    boxes: [N, (z1, y1, x1, z2, y2, x2)]. Notice that (z2, y2, x2) lays outside the box.
-    scores: 1-D array of box scores.
-    threshold: Float. IoU threshold to use for filtering.
-    """
-    assert boxes.shape[0] > 0
-
-    # Compute box areas
-    z1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x1 = boxes[:, 2]
-    z2 = boxes[:, 3]
-    y2 = boxes[:, 4]
-    x2 = boxes[:, 5]
-    vol = (z2 - z1) * (y2 - y1) * (x2 - x1)
-
-    # Get indicies of boxes sorted by scores (highest first)
-    ixs = tf.argsort(scores)[::-1]
-
-    pick = []
-    while len(ixs) > 0:
-        # Pick top box and add its index to the list
-        i = ixs[0]
-        pick.append(i)
-        # Compute IoU of the picked box with the rest
-        iou = compute_iou_graph_3D(boxes[i], boxes[ixs[1:]], vol[i], vol[ixs[1:]])
-        # Identify boxes with IoU over the threshold. This
-        # returns indices into ixs[1:], so add 1 to get
-        # indices into ixs.
-        remove_ixs = tf.where(iou > threshold)[0] + 1
-        # Remove indices of the picked and overlapped boxes.
-        ixs = tf.gather(ixs, remove_ixs)
-        ixs = tf.gather(ixs, 0)
-    return tf.constant(pick[:max_output_size])
+# def non_max_suppression_graph(boxes, scores, max_output_size, threshold):
+#     """Performs non-maximum suppression and returns indices of kept boxes.
+#     boxes: [N, (z1, y1, x1, z2, y2, x2)]. Notice that (z2, y2, x2) lays outside the box.
+#     scores: 1-D array of box scores.
+#     threshold: Float. IoU threshold to use for filtering.
+#     """
+#     assert boxes.shape[0] > 0
+#
+#     # Compute box areas
+#     z1 = boxes[:, 0]
+#     y1 = boxes[:, 1]
+#     x1 = boxes[:, 2]
+#     z2 = boxes[:, 3]
+#     y2 = boxes[:, 4]
+#     x2 = boxes[:, 5]
+#     vol = (z2 - z1) * (y2 - y1) * (x2 - x1)
+#
+#     # Get indicies of boxes sorted by scores (highest first)
+#     ixs = tf.argsort(scores)[::-1]
+#
+#     pick = []
+#     while len(ixs) > 0:
+#         # Pick top box and add its index to the list
+#         i = ixs[0]
+#         pick.append(i)
+#         # Compute IoU of the picked box with the rest
+#         iou = compute_iou_graph_3D(boxes[i], boxes[ixs[1:]], vol[i], vol[ixs[1:]])
+#         # Identify boxes with IoU over the threshold. This
+#         # returns indices into ixs[1:], so add 1 to get
+#         # indices into ixs.
+#         remove_ixs = tf.where(iou > threshold)[0] + 1
+#         # Remove indices of the picked and overlapped boxes.
+#         ixs = tf.gather(ixs, remove_ixs)
+#         ixs = tf.gather(ixs, 0)
+#     return tf.constant(pick[:max_output_size])
 
 def apply_box_deltas(boxes, deltas):
     """Applies the given deltas to the given boxes.
@@ -481,11 +481,10 @@ def expand_mask(bbox, mini_mask, image_shape):
 #  Anchors
 ############################################################
 
-def generate_anchors(scales, ratios_xy, ratios_xz, shape, feature_stride, anchor_stride):
+def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
     """
     scales: 1D array of anchor sizes in pixels. Example: [32, 64, 128]
-    ratios_xy: 1D array of anchor ratios of width/height. Example: [0.5, 1, 2]
-    ratios_xz: 1D array of anchor ratios of width/depth. Example: [0.5, 1, 2]
+    ratios: 1D array of anchor ratios of width/height. Example: [0.5, 1, 2]
     shape: [depth, eight, width] spatial shape of the feature map over which
             to generate anchors.
     feature_stride: Stride of the feature map relative to the image in pixels.
@@ -493,18 +492,21 @@ def generate_anchors(scales, ratios_xy, ratios_xz, shape, feature_stride, anchor
         value is 2 then generate anchors for every other feature map pixel.
     """
     # Get all combinations of scales and ratios
-    scales, ratios_xy, ratios_xz = np.meshgrid(np.array(scales), np.array(ratios_xy), np.array(ratios_xz))
+    scales_z = scales #/2
+    feature_stride_z = feature_stride #/2
+    scales, ratios = np.meshgrid(np.array(scales), np.array(ratios))
     scales = scales.flatten()
-    ratios_xy = ratios_xy.flatten()
-    ratios_xz = ratios_xz.flatten()
+    ratios = ratios.flatten()
 
     # Enumerate depths, heights and widths from scales and the 2 ratios
-    depths = scales * np.sqrt(ratios_xz)
-    heights = scales / np.sqrt(ratios_xy)
-    widths = scales * np.sqrt(ratios_xy)
+    # depths = scales * np.sqrt(ratios)
+    depths = np.tile(np.array(scales_z),
+                         len(ratios)//np.array(scales_z)[..., None].shape[0])
+    heights = scales / np.sqrt(ratios)
+    widths = scales * np.sqrt(ratios)
 
     # Enumerate shifts in feature space
-    shifts_z = np.arange(0, shape[0], anchor_stride) * feature_stride
+    shifts_z = np.arange(0, shape[0], anchor_stride) * feature_stride_z
     shifts_y = np.arange(0, shape[1], anchor_stride) * feature_stride
     shifts_x = np.arange(0, shape[2], anchor_stride) * feature_stride
     shifts_x, shifts_y, shifts_z = np.meshgrid(shifts_x, shifts_y, shifts_z)
@@ -517,7 +519,8 @@ def generate_anchors(scales, ratios_xy, ratios_xz, shape, feature_stride, anchor
     # Reshape to get a list of (z, y, x) and a list of (d, h, w)
     box_centers = np.stack(
         [box_centers_z, box_centers_y, box_centers_x], axis=2).reshape([-1, 3])
-    box_sizes = np.stack([box_depths, box_heights, box_widths], axis=2).reshape([-1, 3])
+    box_sizes = np.stack(
+        [box_depths, box_heights, box_widths], axis=2).reshape([-1, 3])
 
     # Convert to corner coordinates (z1, y1, x1, z2, y2, x2)
     boxes = np.concatenate([box_centers - 0.5 * box_sizes,
@@ -525,8 +528,8 @@ def generate_anchors(scales, ratios_xy, ratios_xz, shape, feature_stride, anchor
 
     return boxes
 
-def generate_pyramid_anchors(scales, ratios_xy, ratios_xz, feature_shapes, feature_strides,
-                             anchor_stride):
+def generate_pyramid_anchors(scales, ratios, feature_shapes,
+                             feature_strides, anchor_stride):
     """Generate anchors at different levels of a feature pyramid. Each scale
     is associated with a level of the pyramid, but each ratio is used in
     all levels of the pyramid.
@@ -540,7 +543,7 @@ def generate_pyramid_anchors(scales, ratios_xy, ratios_xz, feature_shapes, featu
     # [anchor_count, (z1, y1, x1, z2, y2, x2)]
     anchors = []
     for i in range(len(scales)):
-        anchors.append(generate_anchors_3D(scales[i], ratios_xy, ratios_xz, feature_shapes[i],
+        anchors.append(generate_anchors(scales[i], ratios, feature_shapes[i],
                                         feature_strides[i], anchor_stride))
     return np.concatenate(anchors, axis=0)
 
@@ -548,3 +551,25 @@ def generate_pyramid_anchors(scales, ratios_xy, ratios_xz, feature_shapes, featu
 ############################################################
 #  Miscellaneous
 ############################################################
+
+def trim_zeros(x):
+    """It's common to have tensors larger than the available data and
+    pad with zeros. This function removes rows that are all zeros.
+    x: [rows, columns].
+    """
+    assert len(x.shape) == 2
+    return x[~np.all(x == 0, axis=1)]
+
+def norm_boxes(boxes, shape):
+    """Converts boxes from pixel coordinates to normalized coordinates.
+    boxes: [N, (z1, y1, x1, z2, y2, x2)] in pixel coordinates
+    shape: [..., (depth, height, width)] in pixels
+    Note: In pixel coordinates (z2, y2, x2) is outside the box. But in normalized
+    coordinates it's inside the box.
+    Returns:
+        [N, (z1, y1, x1, z2 y2, x2)] in normalized coordinates
+    """
+    d, h, w = shape
+    scale = np.array([d - 1, h - 1, w - 1, d - 1, h - 1, w - 1])
+    shift = np.array([0, 0, 0, 1, 1, 1])
+    return np.divide((boxes - shift), scale).astype(np.float32)

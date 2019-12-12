@@ -1,48 +1,188 @@
 import os
 import sys
+import logging
 import math
 import random
 import numpy as np
-import argparse
 import warnings
-import time
-import pickle
 import cv2
 import scipy
-import torch
+import skimage.color
+import skimage.io
+import skimage.transform
 
-
-
-sys.path.append(os.path.dirname(os.path.realpath('__file__')))
-root_dir = os.path.dirname(os.path.realpath('__file__'))
-print(root_dir)
-
-exp_name = 'shapes'
-image_height = image_width = 320
-train_dir = os.path.join(root_dir, exp_name, 'train')
-val_dir = os.path.join(root_dir, exp_name, 'val')
-print(train_dir)
-print(val_dir)
 
 ############################################################
 #  Dataset
 ############################################################
 
-class ShapesDataset(utils.Dataset):
+class Dataset(object):
+    """The base class for dataset classes.
+    To use it, create a new class that adds functions specific to the dataset
+    you want to use. For example:
+    class CatsAndDogsDataset(Dataset):
+        def load_cats_and_dogs(self):
+            ...
+        def load_mask(self, image_id):
+            ...
+        def image_reference(self, image_id):
+            ...
+    See COCODataset and ShapesDataset as examples.
+    """
+
+    def __init__(self, class_map=None):
+        self._image_ids = []
+        self.image_info = []
+        # Background is always the first class
+        self.class_info = [{"source": "", "id": 0, "name": "BG"}]
+        self.source_class_ids = {}
+
+    def add_class(self, source, class_id, class_name):
+        assert "." not in source, "Source name cannot contain a dot"
+        # Does the class exist already?
+        for info in self.class_info:
+            if info['source'] == source and info["id"] == class_id:
+                # source.class_id combination already available, skip
+                return
+        # Add the class
+        self.class_info.append({
+            "source": source,
+            "id": class_id,
+            "name": class_name,
+        })
+
+    def add_image(self, source, image_id, path, **kwargs):
+        image_info = {
+            "id": image_id,
+            "source": source,
+            "path": path,
+        }
+        image_info.update(kwargs)
+        self.image_info.append(image_info)
+
+    def image_reference(self, image_id):
+        """Return a link to the image in its source Website or details about
+        the image that help looking it up or debugging it.
+        Override for your dataset, but pass to this function
+        if you encounter images not in your dataset.
+        """
+        return ""
+
+    def prepare(self, class_map=None):
+        """Prepares the Dataset class for use.
+        TODO: class map is not supported yet. When done, it should handle mapping
+              classes from different datasets to the same class ID.
+        """
+
+        def clean_name(name):
+            """Returns a shorter version of object names for cleaner display."""
+            return ",".join(name.split(",")[:1])
+
+        # Build (or rebuild) everything else from the info dicts.
+        self.num_classes = len(self.class_info)
+        self.class_ids = np.arange(self.num_classes)
+        self.class_names = [clean_name(c["name"]) for c in self.class_info]
+        self.num_images = len(self.image_info)
+        self._image_ids = np.arange(self.num_images)
+
+        # Mapping from source class and image IDs to internal IDs
+        self.class_from_source_map = {"{}.{}".format(info['source'], info['id']): id
+                                      for info, id in zip(self.class_info, self.class_ids)}
+        self.image_from_source_map = {"{}.{}".format(info['source'], info['id']): id
+                                      for info, id in zip(self.image_info, self.image_ids)}
+
+        # Map sources to class_ids they support
+        self.sources = list(set([i['source'] for i in self.class_info]))
+        self.source_class_ids = {}
+        # Loop over datasets
+        for source in self.sources:
+            self.source_class_ids[source] = []
+            # Find classes that belong to this dataset
+            for i, info in enumerate(self.class_info):
+                # Include BG class in all datasets
+                if i == 0 or source == info['source']:
+                    self.source_class_ids[source].append(i)
+
+    def map_source_class_id(self, source_class_id):
+        """Takes a source class ID and returns the int class ID assigned to it.
+        For example:
+        dataset.map_source_class_id("coco.12") -> 23
+        """
+        return self.class_from_source_map[source_class_id]
+
+    def get_source_class_id(self, class_id, source):
+        """Map an internal class ID to the corresponding class ID in the source dataset."""
+        info = self.class_info[class_id]
+        assert info['source'] == source
+        return info['id']
+
+    @property
+    def image_ids(self):
+        return self._image_ids
+
+    def source_image_link(self, image_id):
+        """Returns the path or URL to the image.
+        Override this to return a URL to the image if it's available online for easy
+        debugging.
+        """
+        return self.image_info[image_id]["path"]
+
+    def load_image(self, image_id):
+        """Load the specified image and return a [H,W,3] Numpy array.
+        """
+        # Load image
+        image = skimage.io.imread(self.image_info[image_id]['path'])
+        # If grayscale. Convert to RGB for consistency.
+        if image.ndim != 3:
+            image = skimage.color.gray2rgb(image)
+        # If has an alpha channel, remove it for consistency
+        if image.shape[-1] == 4:
+            image = image[..., :3]
+        return image
+
+    def load_mask(self, image_id):
+        """Load instance masks for the given image.
+        Different datasets use different ways to store masks. Override this
+        method to load instance masks and return them in the form of am
+        array of binary masks of shape [height, width, instances].
+        Returns:
+            masks: A bool array of shape [height, width, instance count] with
+                a binary mask per instance.
+            class_ids: a 1D array of class IDs of the instance masks.
+        """
+        # Override this function to load a mask from your dataset.
+        # Otherwise, it returns an empty mask.
+        logging.warning("You are using the default load_mask(), maybe you need to define your own one.")
+        mask = np.empty([0, 0, 0])
+        class_ids = np.empty([0], np.int32)
+        return mask, class_ids
+
+
+############################################################
+#  Shapes Dataset
+############################################################
+
+class ShapesDataset(Dataset):
     """Generates the shapes synthetic dataset. The dataset consists of simple
     shapes (triangles, squares, circles) placed randomly on a blank surface.
     The images are generated on the fly. No file access required.
     """
-    def __init__(self, out_dir):
-        super(ShapesDataset, self).__init__()
-        self.out_dir = out_dir
-        if not os.path.exists(self.out_dir):
-            os.makedirs(self.out_dir)
-
-    def load_shapes(self, count, height, width):
-        """Generate the requested number of synthetic images.
-        count: number of images to generate.
+    def __init__(self, num_samples, height, width):
+        """
+        num_samples: number of samples images to generate.
         height, width: the size of the generated images.
+        """
+        super(ShapesDataset, self).__init__()
+        self.num_samples = num_samples
+        self.height = height
+        self.width = width
+
+        self.classes = ["background", "square", "circle", "triangle"]
+
+    def load_shapes(self):
+        """Generate the requested number of synthetic images using the
+        user specified number of samples, image height, and image width
+        during instantiation.
         """
         # Add classes
         self.add_class("shapes", 1, "square")
@@ -53,10 +193,10 @@ class ShapesDataset(utils.Dataset):
         # Generate random specifications of images (i.e. color and
         # list of shapes sizes and locations). This is more compact than
         # actual images. Images are generated on the fly in load_image().
-        for i in range(count):
-            bg_color, shapes = self.random_image(height, width)
+        for i in range(self.num_samples):
+            bg_color, shapes = self.random_image(self.height, self.width)
             self.add_image("shapes", image_id=i, path=None,
-                           width=width, height=height,
+                           width=self.width, height=self.height,
                            bg_color=bg_color, shapes=shapes)
 
     def image_reference(self, image_id):
@@ -97,8 +237,11 @@ class ShapesDataset(utils.Dataset):
             mask[:, :, i] = mask[:, :, i] * occlusion
             occlusion = np.logical_and(occlusion, np.logical_not(mask[:, :, i]))
         # Map class names to class IDs.
-        class_ids = np.array([self.class_names.index(s[0]) for s in shapes])
-        return mask.astype(np.bool), class_ids.astype(np.int32)
+        # class_ids = np.array([self.class_names.index(s[0]) for s in shapes])
+
+         # SD - change mask type from bool to uint8 and return class_ids as names
+        class_ids = np.array([s[0] for s in shapes])
+        return mask.astype('uint8'), class_ids #class_ids.astype(np.int32)
 
     def draw_shape(self, image, shape, dims, color):
         """Draws a shape from the given specs."""
@@ -160,20 +303,18 @@ class ShapesDataset(utils.Dataset):
         shapes = [s for i, s in enumerate(shapes) if i in keep_ixs]
         return bg_color, shapes
 
-    def save_image_and_mask(self, image_id):
-        img = self.load_image(image_id)
-        seg, class_id = self.load_mask(image_id)
-        out = np.concatenate((img, seg), axis=2)
-        out_path = os.path.join(self.out_dir, '{}.npy'.format(image_id))
-        self.image_info[image_id]['path'] = out_path
-        np.save(out_path, out)
+    def map_classnames_to_classids(self, classnames):
+        """Maps class names to their numeric id as defined in self.classes and
+        load_shapes(). It returns classids as a numpy array.
 
-        with open(os.path.join(self.out_dir, 'meta_info_{}.pickle'.format(image_id)), 'wb') as handle:
-            pickle.dump([out_path, class_id, str(image_id)], handle)
-
+        Note: Not sure if it model will function the same is returned as a list
+        """
+        classids = np.array([self.classes.index(c) for c in classnames], dtype=np.int)
+        # classids = [self.classes.index(c) for c in classnames] #This returns a list
+        return classids
 
 ############################################################
-#  Utils from Matterport version
+#  Utility Functions
 ############################################################
 
 def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square"):
@@ -345,216 +486,28 @@ def extract_bboxes(mask):
         boxes[i] = np.array([y1, x1, y2, x2])
     return boxes.astype(np.int32)
 
-
-
-############################################################
-#  Execute Training
-############################################################
-
-def load_image_gt(dataset, config, image_id, augment=False, use_mini_mask=False):
-    """Load and return ground truth data for an image (image, mask, bounding boxes).
-    augment: If true, apply random image augmentation. Currently, only horizontal
-        flipping is offered.
-    use_mini_mask: If False, returns full-size masks that are the same height
-        and width as the original image. These can be big, for example
-        1024x1024x100 (for 100 instances). Mini masks are smaller, typically,
-        224x224 and are generated by extracting the bounding box of the
-        object and resizing it to MINI_MASK_SHAPE.
-    Returns:
-    image: [height, width, 3]
-    shape: the original shape of the image before resizing and cropping.
-    class_ids: [instance_count] Integer class IDs
-    bbox: [instance_count, (y1, x1, y2, x2)]
-    mask: [height, width, instance_count]. The height and width are those
-        of the image unless use_mini_mask is True, in which case they are
-        defined in MINI_MASK_SHAPE.
-    """
-    # Load image and mask
-    image = dataset.load_image(image_id)
-    mask, class_ids = dataset.load_mask(image_id)
-    original_shape = image.shape
-    image, window, scale, padding, crop = resize_image(
-        image,
-        min_dim=config.IMAGE_MIN_DIM,
-        min_scale=config.IMAGE_MIN_SCALE,
-        max_dim=config.IMAGE_MAX_DIM,
-        mode=config.IMAGE_RESIZE_MODE)
-    mask = resize_mask(mask, scale, padding, crop)
-
-    # Random horizontal flips.
-    if augment:
-        logging.warning("'augment' is deprecated. Use 'augmentation' instead.")
-        if random.randint(0, 1):
-            image = np.fliplr(image)
-            mask = np.fliplr(mask)
-
-    # Note that some boxes might be all zeros if the corresponding mask got cropped out.
-    # and here is to filter them out
-    _idx = np.sum(mask, axis=(0, 1)) > 0
-    mask = mask[:, :, _idx]
-    class_ids = class_ids[_idx]
-
-    # Bounding boxes. Note that some boxes might be all zeros
-    # if the corresponding mask got cropped out.
-    # bbox: [num_instances, (y1, x1, y2, x2)]
-    bbox = extract_bboxes(mask)
-
-    # Active classes
-    # Different datasets have different classes, so track the
-    # classes supported in the dataset of this image.
-    active_class_ids = np.zeros([dataset.num_classes], dtype=np.int32)
-    source_class_ids = dataset.source_class_ids[dataset.image_info[image_id]["source"]]
-    active_class_ids[source_class_ids] = 1
-
-    # Resize masks to smaller size to reduce memory usage
-    # if use_mini_mask:
-    #     mask = minimize_mask(bbox, mask, config.MINI_MASK_SHAPE)
-
-    # Image meta data
-#     image_meta = compose_image_meta(image_id, original_shape, image.shape,
-#                                     window, scale, active_class_ids)
-    return image, class_ids, bbox, mask
-
-
-def train(logger, dataset_train, net):
-    """
-    perform the training routine for a given fold. saves plots and selected parameters to the experiment dir
-    specified in the configs.
-    """
-    logger.info('performing training in {}D over fold {} on experiment {} with model {}'.format(
-        cf.dim, cf.fold, cf.exp_dir, cf.model))
-
-    # net = net(cf, logger).cuda()
-    optimizer = torch.optim.Adam(net.parameters(), lr=cf.learning_rate[0], weight_decay=cf.weight_decay)
-    model_selector = utils.ModelSelector(cf, logger)
-    train_evaluator = Evaluator(cf, logger, mode='train')
-    val_evaluator = Evaluator(cf, logger, mode=cf.val_mode)
-
-    starting_epoch = 1
-
-    # prepare monitoring
-    monitor_metrics, TrainingPlot = utils.prepare_monitoring(cf)
-
-    if cf.resume_to_checkpoint:
-        starting_epoch, monitor_metrics = utils.load_checkpoint(cf.resume_to_checkpoint, net, optimizer)
-        logger.info('resumed to checkpoint {} at epoch {}'.format(cf.resume_to_checkpoint, starting_epoch))
-
-    logger.info('loading dataset and initializing batch generators...')
-#     batch_gen = data_loader.get_train_generators(cf, logger)
-
-
-    for epoch in range(starting_epoch, cf.num_epochs + 1):
-        logger.info('starting training epoch {}'.format(epoch))
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = cf.learning_rate[epoch - 1]
-
-        start_time = time.time()
-
-        net.train() # function built into nn.module
-        train_results_list = []
-        num_train_batches = len(dataset_train.image_ids)
-        for bix in range(num_train_batches):
-#             batch = next(batch_gen['train'])
-            batch = {}
-            image, class_id, bbox, mask = load_image_gt(dataset_train, config, bix)
-
-            batch['data'] = image
-            batch['roi_labels'] = class_id
-            batch['bb_target'] = bbox
-            batch['roi_masks'] = mask
-            batch['pid'] = dataset_train.image_ids[0]
-
-            tic_fw = time.time()
-            results_dict = net.train_forward(batch) ### TODO: ensure this works with mods
-            tic_bw = time.time()
-            optimizer.zero_grad()
-            results_dict['torch_loss'].backward()
-            optimizer.step()
-            logger.info('tr. batch {0}/{1} (ep. {2}) fw {3:.3f}s / bw {4:.3f}s / total {5:.3f}s || '
-                        .format(bix + 1, num_train_batches, epoch, tic_bw - tic_fw,
-                                time.time() - tic_bw, time.time() - tic_fw) + results_dict['logger_string'])
-            train_results_list.append([results_dict['boxes'], batch['pid']])
-            monitor_metrics['train']['monitor_values'][epoch].append(results_dict['monitor_values'])
-
-        _, monitor_metrics['train'] = train_evaluator.evaluate_predictions(train_results_list, monitor_metrics['train'])
-        train_time = time.time() - start_time
-
-        logger.info('starting validation in mode {}.'.format(cf.val_mode))
-        with torch.no_grad():
-            net.eval()
-        #     if cf.do_validation:
-        #         val_results_list = []
-        #         val_predictor = Predictor(cf, net, logger, mode='val')
-        #         num_val_batches = len(dataset_val.image_ids)
-        #         for _ in range(num_val_batches):
-        #             # batch = next(batch_gen[cf.val_mode])
-        #
-        #             if cf.val_mode == 'val_patient':
-        #                 results_dict = val_predictor.predict_patient(batch)
-        #             elif cf.val_mode == 'val_sampling':
-        #                 results_dict = net.train_forward(batch, is_validation=True)
-        #             val_results_list.append([results_dict['boxes'], batch['pid']])
-        #             monitor_metrics['val']['monitor_values'][epoch].append(results_dict['monitor_values'])
-        #
-        #         _, monitor_metrics['val'] = val_evaluator.evaluate_predictions(val_results_list, monitor_metrics['val'])
-        #         model_selector.run_model_selection(net, optimizer, monitor_metrics, epoch)
-
-            # update monitoring and prediction plots
-            TrainingPlot.update_and_save(monitor_metrics, epoch)
-            epoch_time = time.time() - start_time
-            logger.info('trained epoch {}: took {} sec. ({} train / {} val)'.format(
-                epoch, epoch_time, train_time, epoch_time-train_time))
-            # batch = next(batch_gen['val_sampling'])
-            # results_dict = net.train_forward(batch, is_validation=True)
-            # logger.info('plotting predictions from validation sampling.')
-            # plot_batch_prediction(batch, results_dict, cf)
-
-        print('End of epoch {}'.format(starting_epoch))
-
-# def test(logger):
-#     """
-#     perform testing for a given fold (or hold out set). save stats in evaluator.
-#     """
-#     logger.info('starting testing model of fold {} in exp {}'.format(cf.fold, cf.exp_dir))
-#     net = model.net(cf, logger).cuda()
-#     test_predictor = Predictor(cf, net, logger, mode='test')
-#     test_evaluator = Evaluator(cf, logger, mode='test')
-#     batch_gen = data_loader.get_test_generator(cf, logger)
-#     test_results_list = test_predictor.predict_test_set(batch_gen, return_results=True)
-#     test_evaluator.evaluate_predictions(test_results_list)
-#     test_evaluator.score_test_df()
-
-
-
 if __name__ == "__main__":
+    sys.path.append(os.path.dirname(os.path.realpath('__file__')))
+    root_dir = os.path.dirname(os.path.realpath('__file__'))
+    print(root_dir)
+
+    exp_name = 'shapes'
+    image_height = image_width = 320
+    train_dir = os.path.join(root_dir, exp_name, 'train')
+    val_dir = os.path.join(root_dir, exp_name, 'val')
+    print(train_dir)
+    print(val_dir)
+
     # Training dataset
-    dataset_train = ShapesDataset(train_dir)
-    dataset_train.load_shapes(500, image_height, image_width)
-    dataset_train.prepare()
+    train_dataset = ShapesDataset(train_dir)
+    train_dataset.load_shapes(300, height=320, width=320) # hardcoded these values
+    train_dataset.prepare()
 
-    # Validation dataset
-    dataset_val = ShapesDataset(val_dir)
-    dataset_val.load_shapes(50, image_height, image_width)
-    dataset_val.prepare()
+    all_data = load_dataset(cf, logger, train_dataset)
+    all_pids_list = np.unique([v['pid'] for (k, v) in all_data.items()])
 
-    # Testing dataset creation
-    image_ids = np.random.choice(dataset_train.image_ids, 4)
-    for image_id in image_ids:
-        image = dataset_train.load_image(image_id)
-        mask, class_ids = dataset_train.load_mask(image_id)
-        print(image.shape)
-        print(mask.shape)
-        print(dataset_train.image_info[image_id],'\n')
+    train_pids = all_pids_list[:200] # hardcoded these values
+    val_pids = all_pids_list[200:300]
 
-    import utils.exp_utils as utils
-    from evaluator import Evaluator
-    from predictor import Predictor
-    from mrcnn import net
-
-    # Begin training
-    # cf = utils.prep_exp(args.exp_source, args.exp_dir, args.server_env, args.use_stored_settings)
-    # cf.slurm_job_id = args.slurm_job_id
-
-    # logger = utils.get_logger(exp_dir)
-    # model = net(cf, logger).cuda()
-    # train(logger, dataset_train, model)
+    train_data = {k: v for (k, v) in all_data.items() if any(p == v['pid'] for p in train_pids)}
+    val_data = {k: v for (k, v) in all_data.items() if any(p == v['pid'] for p in val_pids)}

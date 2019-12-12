@@ -82,28 +82,6 @@ def compute_iou(box, boxes, box_vol, boxes_vol):
     iou = intersection / union
     return iou
 
-def compute_iou_graph(box, boxes, box_vol, boxes_vol):
-    """Calculates IoU of the given box with the array of the given boxes.
-    box: 1D vector [z1, y1, x1, z2, y2, x2]
-    boxes: [boxes_count, (z1, y1, x1, z2, y2, x2)]
-    box_vol: float. the volume of 'box'
-    boxes_vol: array of length boxes_count.
-
-    Note: the volumes are passed in rather than calculated here for
-    efficiency. Calculate once in the caller to avoid duplicate work.
-    """
-    # Calculate intersection volumes
-    z1 = tf.maximum(box[0], boxes[:, 0])
-    z2 = tf.minimum(box[3], boxes[:, 3])
-    y1 = tf.maximum(box[1], boxes[:, 1])
-    y2 = tf.minimum(box[4], boxes[:, 4])
-    x1 = tf.maximum(box[2], boxes[:, 2])
-    x2 = tf.minimum(box[5], boxes[:, 5])
-    intersection = tf.maximum(x2 - x1, 0) * tf.maximum(y2 - y1, 0) * tf.maximum(z2 - z1, 0)
-    union = box_vol + boxes_vol[:] - intersection[:]
-    iou = intersection / union
-    return iou
-
 def compute_overlaps(boxes1, boxes2):
     """Computes IoU overlaps between two sets of boxes.
     boxes1, boxes2: [N, (z1, y1, x1, z2, y2, x2)].
@@ -119,14 +97,14 @@ def compute_overlaps(boxes1, boxes2):
     overlaps = np.zeros((boxes1.shape[0], boxes2.shape[0]))
     for i in range(overlaps.shape[1]):
         box2 = boxes2[i]
-        overlaps[:, i] = compute_iou_3D(box2, boxes1, vol2[i], vol1)
+        overlaps[:, i] = compute_iou(box2, boxes1, vol2[i], vol1)
     return overlaps
 
 def compute_overlaps_masks(masks1, masks2):
     """Computes IoU overlaps between two sets of masks.
     masks1, masks2: [Depth, Height, Width, instances]
     """
-    
+
     # If either set of masks is empty return empty result
     if masks1.shape[-1] == 0 or masks2.shape[-1] == 0:
         return np.zeros((masks1.shape[-1], masks2.shape[-1]))
@@ -140,7 +118,6 @@ def compute_overlaps_masks(masks1, masks2):
     intersections = np.dot(masks1.transpose(), masks2)
     union = vol1[:, None] + vol2[None, :] - intersections
     overlaps = intersections / union
-
     return overlaps
 
 def non_max_suppression(boxes, scores, threshold):
@@ -329,7 +306,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="cube")
         none: No resizing. Return the image unchanged.
         cube: Resize and pad with zeros to get a cube image
             of size [max_dim, max_dim, max_dim].
-        pad64: Pads width, height and depth with zeros to make them multiples 
+        pad64: Pads width, height and depth with zeros to make them multiples
                of 64.
                If min_dim or min_scale are provided, it scales the image up
                before padding. max_dim is ignored in this mode.
@@ -347,7 +324,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="cube")
         coordinates of the image part of the full image (excluding
         the padding). The x2, y2, z2 pixels are not included.
     scale: The scale factor used to resize the image
-    padding: Padding added to the image 
+    padding: Padding added to the image
     [(front, back), (top, bottom), (left, right), (0,0)]
     TODO: check if to take into account (or not) a fourth dimension for the
     channels
@@ -379,7 +356,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="cube")
 
     # Resize image using bilinear interpolation
     if scale != 1:
-        image = resize(image, 
+        image = resize(image,
                        (round(d * scale), round(h * scale), round(w * scale)),
                        preserve_range=True)
 
@@ -393,10 +370,10 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="cube")
         bottom_pad = max_dim - h - top_pad
         left_pad = (max_dim - w) // 2
         right_pad = max_dim - w - left_pad
-        padding = [(front_pad, back_pad), (top_pad, bottom_pad), 
+        padding = [(front_pad, back_pad), (top_pad, bottom_pad),
                    (left_pad, right_pad)]
         image = np.pad(image, padding, mode='constant', constant_values=0)
-        window = (front_pad, top_pad, left_pad, 
+        window = (front_pad, top_pad, left_pad,
                   d + front_pad, h + top_pad, w + left_pad)
     elif mode == "pad64":
         d, h, w = image.shape[:3]
@@ -423,10 +400,10 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="cube")
             right_pad = max_w - w - left_pad
         else:
             left_pad = right_pad = 0
-        padding = [(front_pad, back_pad), (top_pad, bottom_pad), 
+        padding = [(front_pad, back_pad), (top_pad, bottom_pad),
                    (left_pad, right_pad)]
         image = np.pad(image, padding, mode='constant', constant_values=0)
-        window = (front_pad, top_pad, left_pad, 
+        window = (front_pad, top_pad, left_pad,
                   d + front_pad, h + top_pad, w + left_pad)
     elif mode == "crop":
         # Pick a random crop
@@ -571,4 +548,3 @@ def generate_pyramid_anchors(scales, ratios_xy, ratios_xz, feature_shapes, featu
 ############################################################
 #  Miscellaneous
 ############################################################
-

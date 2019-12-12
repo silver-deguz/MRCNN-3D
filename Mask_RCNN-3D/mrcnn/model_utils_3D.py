@@ -245,7 +245,7 @@ def parse_image_meta(meta):
     image_id = meta[:, 0]
     original_image_shape = meta[:, 1:5]
     image_shape = meta[:, 5:9]
-    window = meta[:, 9:15]  # (z1, y1, x1, z2, y2, x2) window of image in in pixels
+    window = meta[:, 9:15]  # (z1, y1, x1, z2, y2, x2) window of image in pixels
     scale = meta[:, 15]
     active_class_ids = meta[:, 16:]
     return {
@@ -326,7 +326,49 @@ def compute_backbone_shapes(config, image_shape):
         [  [int(math.ceil(image_shape[0] / stride)),
             int(math.ceil(image_shape[1] / stride)),
             int(math.ceil(image_shape[2] / stride))]
-            for stride in config.BACKBONE_STRIDES])
+            for stride in config.BACKBONE_STRIDES  ])
+
+
+# ## Batch Slicing
+# Some custom layers support a batch size of 1 only, and require a lot of work
+# to support batches greater than 1. This function slices an input tensor
+# across the batch dimension and feeds batches of size 1. Effectively,
+# an easy way to support batches > 1 quickly with little code modification.
+# In the long run, it's more efficient to modify the code to support large
+# batches and getting rid of this function. Consider this a temporary solution
+def batch_slice(inputs, graph_fn, batch_size, names=None):
+    """Splits inputs into slices and feeds each slice to a copy of the given
+    computation graph and then combines the results. It allows you to run a
+    graph on a batch of inputs even if the graph is written to support one
+    instance only.
+    inputs: list of tensors. All must have the same first dimension length
+    graph_fn: A function that returns a TF tensor that's part of a graph.
+    batch_size: number of slices to divide the data into.
+    names: If provided, assigns names to the resulting tensors.
+    """
+    if not isinstance(inputs, list):
+        inputs = [inputs]
+
+    outputs = []
+    for i in range(batch_size):
+        inputs_slice = [x[i] for x in inputs]
+        output_slice = graph_fn(*inputs_slice)
+        if not isinstance(output_slice, (tuple, list)):
+            output_slice = [output_slice]
+        outputs.append(output_slice)
+    # Change outputs from a list of slices where each is
+    # a list of outputs to a list of outputs and each has
+    # a list of slices
+    outputs = list(zip(*outputs))
+
+    if names is None:
+        names = [None] * len(outputs)
+
+    result = [tf.stack(o, axis=0, name=n)
+              for o, n in zip(outputs, names)]
+    if len(result) == 1:
+        result = result[0]
+    return result
 
 
 def trim_zeros(boxes, name='trim_zeros'):
@@ -349,6 +391,10 @@ def batch_pack(x, counts, num_rows):
         outputs.append(x[i, :counts[i]])
     return tf.concat(outputs, axis=0)
 
+
+############################################################
+#  Bounding Boxes
+############################################################
 
 def norm_boxes(boxes, shape):
     """Converts boxes from pixel coordinates to normalized coordinates.
@@ -378,3 +424,128 @@ def denorm_boxes(boxes, shape):
     scale = tf.concat([d, h, w, d, h, w], axis=-1) - tf.constant(1.0)
     shift = tf.constant([0., 0., 0., 1., 1., 1.])
     return tf.cast(tf.round(tf.multiply(boxes, scale) + shift), tf.int32)
+
+
+# def compute_iou(box, boxes, box_vol, boxes_vol):
+#     """Calculates IoU of the given box with the array of the given boxes.
+#     box: 1D vector [z1, y1, x1, z2, y2, x2]
+#     boxes: [boxes_count, (z1, y1, x1, z2, y2, x2)]
+#     box_vol: float. the volume of 'box'
+#     boxes_vol: array of length boxes_count.
+#
+#     Note: the volumes are passed in rather than calculated here for
+#     efficiency. Calculate once in the caller to avoid duplicate work.
+#     """
+#     # Calculate intersection volumes
+#     z1 = tf.maximum(box[0], boxes[:, 0])
+#     z2 = tf.minimum(box[3], boxes[:, 3])
+#     y1 = tf.maximum(box[1], boxes[:, 1])
+#     y2 = tf.minimum(box[4], boxes[:, 4])
+#     x1 = tf.maximum(box[2], boxes[:, 2])
+#     x2 = tf.minimum(box[5], boxes[:, 5])
+#     intersection = tf.maximum(x2 - x1, 0) * tf.maximum(y2 - y1, 0) * tf.maximum(z2 - z1, 0)
+#     union = box_vol + boxes_vol[:] - intersection[:]
+#     iou = intersection / union
+#     return iou
+
+# TODO: verify this works correctly for 3D
+# def non_max_suppression(boxes, scores, max_output_size, threshold):
+#     """Performs non-maximum suppression and returns indices of kept boxes.
+#     boxes: [N, (z1, y1, x1, z2, y2, x2)].
+#     scores: 1-D tensor of box scores.
+#     threshold: IoU threshold to use for filtering.
+#     """
+#     assert boxes.shape[0] > 0
+#
+#     # Compute box volumes
+#     z1 = boxes[:, 0]
+#     y1 = boxes[:, 1]
+#     x1 = boxes[:, 2]
+#     z2 = boxes[:, 3]
+#     y2 = boxes[:, 4]
+#     x2 = boxes[:, 5]
+#     vol = (z2 - z1) * (y2 - y1) * (x2 - x1)
+#
+#     # Get indicies of boxes sorted by scores (highest first)
+#     ixs = tf.nn.top_k(scores, len(boxes), sorted=True,
+#                      name="top_anchors").indices
+#     # ixs = tf.argsort(scores)[::-1]
+#
+#     keep = []
+#     while len(ixs) > 0:
+#         # Pick top box and add its index to the list
+#         i = ixs[0]
+#         keep.append(i)
+#         # Compute IoU of the picked box with the rest
+#         iou = compute_iou(boxes[i], boxes[ixs[1:]], vol[i], vol[ixs[1:]])
+#         # Identify boxes with IoU over the threshold. This
+#         # returns indices into ixs[1:], so add 1 to get
+#         # indices into ixs.
+#         remove_ixs = tf.where(iou > threshold)[0] + 1
+#         # Remove indices of the picked and overlapped boxes.
+#         ixs = tf.gather(ixs, remove_ixs)
+#         ixs = tf.gather(ixs, 0)
+#     return tf.constant(keep[:max_output_size])
+
+def compute_iou(box, boxes, box_vol, boxes_vol):
+    """Calculates IoU of the given box with the array of the given boxes.
+    box: 1D vector [z1, y1, x1, z2, y2, x2]
+    boxes: [boxes_count, (z1, y1, x1, z2, y2, x2)]
+    box_vol: float. the volume of 'box'
+    boxes_vol: array of length boxes_count.
+
+    Note: the volumes are passed in rather than calculated here for
+    efficiency. Calculate once in the caller to avoid duplicate work.
+    """
+    # Calculate intersection volumes
+    print('here')
+    z1 = np.maximum(box[0], boxes[:, 0])
+    z2 = np.minimum(box[3], boxes[:, 3])
+    y1 = np.maximum(box[1], boxes[:, 1])
+    y2 = np.minimum(box[4], boxes[:, 4])
+    x1 = np.maximum(box[2], boxes[:, 2])
+    x2 = np.minimum(box[5], boxes[:, 5])
+    intersection = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0) * np.maximum(z2 - z1, 0)
+    union = box_vol + boxes_vol[:] - intersection[:]
+    iou = intersection / union
+    return iou
+
+def non_max_suppression(boxes, scores, max_output_size, threshold):
+    """Performs non-maximum suppression and returns indices of kept boxes.
+    boxes: [N, (z1, y1, x1, z2, y2, x2)].
+    scores: 1-D array of box scores.
+    threshold: IoU threshold to use for filtering.
+
+    input are numpy arrays, output is tensor
+    """
+    assert boxes.shape[0] > 0
+
+    # Compute box volumes
+    z1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x1 = boxes[:, 2]
+    z2 = boxes[:, 3]
+    y2 = boxes[:, 4]
+    x2 = boxes[:, 5]
+    vol = (z2 - z1) * (y2 - y1) * (x2 - x1)
+
+    # print(scores.numpy())
+    # ixs = scores.argsort()[::-1]
+    ixs = tf.argsort(scores, direction='DESCENDING')[::-1]
+    # ixs = tf.nn.top_k(scores, boxes.shape[0], sorted=True,
+                     # name="top_anchors").indices
+    pick = []
+    while ixs.shape[0] > 0:
+        # Pick top box and add its index to the list
+        i = ixs[0]
+        pick.append(i)
+        # Compute IoU of the picked box with the rest
+        iou = compute_iou(boxes[i], boxes[ixs[1:]], vol[i], vol[ixs[1:]])
+        # Identify boxes with IoU over the threshold. This
+        # returns indices into ixs[1:], so add 1 to get
+        # indices into ixs.
+        remove_ixs = np.where(iou > threshold)[0] + 1
+        # Remove indices of the picked and overlapped boxes.
+        ixs = np.delete(ixs, remove_ixs)
+        ixs = np.delete(ixs, 0)
+    return tf.constant(pick[:max_output_size])

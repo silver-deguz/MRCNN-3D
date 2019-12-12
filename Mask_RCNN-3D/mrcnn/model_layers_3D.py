@@ -1,16 +1,19 @@
+import numpy as np
 import tensorflow as tf
 import keras
 import keras.engine as KE
-import keras.models as KM
+from keras.models import Model
 from keras.layers import Conv3D, Conv3DTranspose, Dense, Reshape
 from keras.layers import Input, Lambda, Activation, TimeDistributed
 
-from utils_3D import batch_slice
-from crop_resize_3D import crop_resize_3D
-from nms_3D import nms_3D
-import modelutils_3D as mutils
-from modelutils_3D import BatchNorm
 import utils_3D as utils
+from utils_3D import non_max_suppression as nms_3D
+import model_utils_3D as mutils
+from model_utils_3D import BatchNorm, batch_slice
+import crop_resize_3D
+from crop_resize_3D import crop_and_resize as cr_3D
+
+# from nms_3D import nms_3D
 
 ############################################################
 #  Proposal Layer
@@ -52,7 +55,7 @@ def clip_boxes(boxes, window):
     """
     # Split
     wz1, wy1, wx1, wz2, wy2, wx2 = tf.split(window, 6)
-    y1, x1, y2, x2 = tf.split(boxes, 4, axis=1)
+    z1, y1, x1, z2, y2, x2 = tf.split(boxes, 6, axis=1)
     # Clip
     z1 = tf.maximum(tf.minimum(z1, wz2), wz1)
     y1 = tf.maximum(tf.minimum(y1, wy2), wy1)
@@ -63,6 +66,15 @@ def clip_boxes(boxes, window):
     clipped = tf.concat([z1, y1, x1, z2, y2, x2], axis=1, name="clipped_boxes")
     clipped.set_shape((clipped.shape[0], 6))
     return clipped
+
+
+def nms_proposals(boxes, scores, proposal_count, nms_threshold):
+     indices = mutils.non_max_suppression(boxes, scores, proposal_count, nms_threshold)
+     proposals = tf.gather(boxes, indices)
+     # Pad if needed
+     padding = tf.maximum(proposal_count - tf.shape(proposals)[0], 0)
+     proposals = tf.pad(proposals, [(0, padding), (0, 0)])
+     return proposals
 
 
 class ProposalLayer(KE.Layer):
@@ -127,9 +139,9 @@ class ProposalLayer(KE.Layer):
 
         # Non-maximum suppression
         proposals = batch_slice([boxes, scores],
-                                lambda x, y: nms_3D(x, y, self.proposal_count, self.nms_threshold),
-                                self.config.IMAGES_PER_GPU,
-                                names=["rpn_non_max_suppression"])
+                        lambda x, y: nms_proposals(x, y, self.proposal_count, self.nms_threshold),
+                        self.config.IMAGES_PER_GPU,
+                        names=["rpn_non_max_suppression"])
         return proposals
 
     def compute_output_shape(self, input_shape):
@@ -221,8 +233,8 @@ class PyramidROIAlign(KE.Layer):
             # Here we use the simplified approach of a single value per bin,
             # which is how it's done in tf.crop_and_resize()
             # Result: [batch * num_boxes, pool_depth, pool_height, pool_width, channels]
-            cr_roi = crop_resize_3D(feature_maps[i], level_boxes, box_indices,
-                        self.pool_shape, method="bilinear")) # TODO: 3D crop_and_resize
+            cr_roi = cr_3D(feature_maps[i], level_boxes, box_indices,
+                        self.pool_shape, method="bilinear") # TODO: 3D crop_and_resize
             pooled.append(cr_roi)
 
         # Pack pooled features into one tensor
@@ -400,7 +412,7 @@ def detection_targets(proposals, gt_class_ids, gt_boxes, gt_masks, config):
         x2 = (x2 - gt_x1) / gt_w
         boxes = tf.concat([z1, y1, x1, z2, y2, x2], 1)
     box_ids = tf.range(0, tf.shape(roi_masks)[0])
-    masks = crop_resize_3D(tf.cast(roi_masks, tf.float32), boxes,
+    masks = cr_3D(tf.cast(roi_masks, tf.float32), boxes,
                                    box_ids, config.MASK_SHAPE)
     # Remove the extra dimension from masks.
     # TODO: print dimensions and verify squeeze is done correctly
@@ -624,13 +636,13 @@ class DetectionLayer(KE.Layer):
 
 def rpn(feature_map, anchors_per_location, anchor_stride, dim=3):
     """Builds the Region Proposal Network.
-    feature_map: backbone features [batch, depth, height, width, 2*dim]
+    feature_map: backbone features [batch, depth, height, width, pyramid_size]
     anchors_per_location: number of anchors per pixel in the feature map
     anchor_stride: Controls the density of anchors. Typically 1 (anchors for
                    every pixel in the feature map), or 2 (every other pixel).
     Returns:
         rpn_class_logits: [batch, D * H * W * anchors_per_location, 2]
-                           Anchor classifier logits (before softmax)
+                           Anchor classifier logits (before softmax).
         rpn_probs: [batch, D * H * W * anchors_per_location, 2]
                     Anchor classifier probabilities.
         rpn_bbox: [batch, D * H * W * anchors_per_location, (dz, dy, dx, log(dd), log(dh), log(dw))]
@@ -642,8 +654,8 @@ def rpn(feature_map, anchors_per_location, anchor_stride, dim=3):
     shared = Conv3D(512, kernel_size=3, padding='same', activation='relu',
                     strides=anchor_stride, name='rpn_conv_shared')(feature_map)
 
-    # Anchor Score. [batch, depth, height, width, anchors per location * 2].
-    x = Conv3D(2 * anchors_per_location, kernel_size=1, padding='valid',
+    # Anchor Score. [batch, D, H, W, anchors per location * 2].
+    x = Conv3D(anchors_per_location * 2, kernel_size=1, padding='valid',
                activation='linear', name='rpn_class_raw')(shared)
 
     # Reshape to [batch, anchors, 2]
@@ -663,34 +675,29 @@ def rpn(feature_map, anchors_per_location, anchor_stride, dim=3):
     return [rpn_class_logits, rpn_probs, rpn_bbox]
 
 
-class RPN():
+def RPN_model(anchor_stride, anchors_per_location, pyramid_size, dim=3):
     """Builds a Keras model of the Region Proposal Network.
     It wraps the RPN graph so it can be used multiple times with shared
     weights.
-    anchors_per_location: number of anchors per pixel in the feature map
+
     anchor_stride: Controls the density of anchors. Typically 1 (anchors for
                    every pixel in the feature map), or 2 (every other pixel).
-    dim: Dimension of the backbone feature map.
+    anchors_per_location: number of anchors per pixel in the feature map
+    pyramid_size: size of the feature pyramid
+    dim: dimension of the feature data, i.e. 3 for 3D data
+
     Returns a Keras Model object. The model outputs, when called, are:
     rpn_class_logits: [batch, D * H * W * anchors_per_location, 2] Anchor classifier logits (before softmax)
     rpn_probs: [batch, D * H * W * anchors_per_location, 2] Anchor classifier probabilities.
     rpn_bbox: [batch, D * H * W * anchors_per_location, (dz, dy, dx, log(dd), log(dh), log(dw))]
               Deltas to be applied to anchors.
     """
-
-    def __init__(self, anchor_stride, anchors_per_location, pyramid_size, dim=3):
-        self.anchor_stride = anchor_stride
-        self.anchors_per_location = anchors_per_location
-        self.pyramid_size = pyramid_size
-        self.dim = dim
-
-    def build(self):
-        # TODO: verify input_feature_map shape is correct!
-        input_feature_map = Input(shape=[None, None, None, self.pyramid_size],
-                                  name="input_rpn_feature_map")
-        outputs = rpn(input_feature_map, self.anchors_per_location,
-                      self.anchor_stride, self.dim)
-        return Model([input_feature_map], outputs, name="rpn_model")
+    # TODO: verify input_feature_map shape is correct!
+    input_feature_map = Input(shape=[None, None, None, pyramid_size],
+                              name="input_rpn_feature_map")
+    outputs = rpn(input_feature_map, anchors_per_location,
+                  anchor_stride, dim)
+    return Model([input_feature_map], outputs, name="rpn_model")
 
 
 ############################################################

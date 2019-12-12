@@ -6,10 +6,8 @@ Copyright (c) 2017 Matterport, Inc.
 Licensed under the MIT License (see LICENSE for details)
 Written by Waleed Abdulla
 """
-
 import numpy as np
-
-
+import math
 # Base Configuration Class
 # Don't use this class directly. Instead, sub-class it and override
 # the configurations you need to change.
@@ -79,12 +77,8 @@ class Config3D(object):
     RPN_ANCHOR_SCALES = (32, 64, 128, 256, 512)
 
     # Ratios of anchors at each cell (width/height)
-    # A value of 1 represents a square anchor in the xy plane, and 0.5 is a wide anchor
-    RPN_ANCHOR_RATIOS_XY = [0.5, 1, 2]
-
-    # Ratios of anchors at each cell (width/depth)
-    # A value of 1 represents a square anchor in the xy plane, and 0.5 is a wide anchor
-    RPN_ANCHOR_RATIOS_XZ = [0.5, 1, 2]
+    # A value of 1 represents a square anchor, and 0.5 is a wide anchor
+    RPN_ANCHOR_RATIOS = [0.5, 1, 2]
 
     # Anchor stride
     # If 1 then anchors are created for each cell in the backbone feature map.
@@ -232,11 +226,11 @@ class Config3D(object):
 
         # Input image size
         if self.IMAGE_RESIZE_MODE == "crop":
-            self.IMAGE_SHAPE = np.array([self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM,
-                self.IMAGE_CHANNEL_COUNT])
+            self.IMAGE_SHAPE = np.array([self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM,
+                self.IMAGE_MIN_DIM, self.IMAGE_CHANNEL_COUNT])
         else:
-            self.IMAGE_SHAPE = np.array([self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM,
-                self.IMAGE_CHANNEL_COUNT])
+            self.IMAGE_SHAPE = np.array([self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM,
+                self.IMAGE_MAX_DIM, self.IMAGE_CHANNEL_COUNT])
 
         # Image meta data length
         #   meta = [image_id] +                   size=1
@@ -246,6 +240,13 @@ class Config3D(object):
         #          [scale] +                      size=1
         #          list(active_class_ids)         size=num_classes
         self.IMAGE_META_SIZE = 1 + 4 + 4 + 6 + 1 + self.NUM_CLASSES
+
+        # Backbone shape
+        # since we only use ResNet50 or ResNet101, shape is same for both.
+        self.BACKBONE_SHAPES = np.array([[int(math.ceil(self.IMAGE_SHAPE[0] / stride)),
+                                         int(math.ceil(self.IMAGE_SHAPE[1] / stride)),
+                                         int(math.ceil(self.IMAGE_SHAPE[2] / stride))]
+                                         for stride in self.BACKBONE_STRIDES])
 
     def display(self):
         """Display Configuration values."""
